@@ -13,17 +13,15 @@ public class Forex {
 
     private static let baseURLString = "https://cdn.jsdelivr.net/npm/@fawazahmed0/"
 
-    private var allCachedRates: [Rates] = []
+    private var allCachedRates: [String: Rates] = [:]
 
     private func cachedRates(for currencyCode: String) -> Rates? {
-        allCachedRates.first(where: { $0.code == currencyCode })
+        allCachedRates[currencyCode]
     }
 
     private func cacheRates(_ rates: Rates?) {
         guard let rates else { return }
-        // TODO: Conform Equatable
-        allCachedRates.removeAll(where: { $0.code == rates.code })
-        allCachedRates.append(rates)
+        allCachedRates[rates.code] = rates
     }
 
     public func cacheRates(for currencyCode: String) {
