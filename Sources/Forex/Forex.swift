@@ -7,7 +7,7 @@ enum ForexError: Error {
     case dataParsingError(Error)
 }
 
-public class Forex {
+public actor Forex {
     public static let shared: Forex = Forex()
     private init() {}
 
