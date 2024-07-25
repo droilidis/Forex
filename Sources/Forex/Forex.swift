@@ -24,11 +24,9 @@ public actor Forex {
         allCachedRates[rates.code] = rates
     }
 
-    public func cacheRates(for currencyCode: String) {
-        Task {
-            let rates = try? await Self.fetchRates(currency: currencyCode)
-            cacheRates(rates)
-        }
+    public func cacheRates(for currencyCode: String) async {
+        let rates = try? await Self.fetchRates(currency: currencyCode)
+        cacheRates(rates)
     }
 
     public func convert(value: Double, from sourceCurrencyCode: String, to destinationCurrencyCode: String) async -> Double {
@@ -82,7 +80,7 @@ public extension Forex {
 
     static func fetchRates(for date: Date = .now, currency: String) async throws -> Rates {
         guard let url = URL(string: baseURLString)?
-            .appending(path: "currency-api@\(Forex.dateFormatter.string(from: date))")
+            .appending(path: "currency-api@\(dateFormatter.string(from: date))")
             .appending(path: "v1").appending(path: "currencies")
             .appending(path: "\(currency.lowercased()).json")
         else {

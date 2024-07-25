@@ -1,6 +1,6 @@
 import Foundation
 
-public struct Rates: Codable {
+public struct Rates: Codable, Sendable {
     let date: Date
     let code: String
     let pairs: [Pair]
