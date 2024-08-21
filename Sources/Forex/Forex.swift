@@ -25,7 +25,7 @@ public actor Forex {
     }
 
     public func cacheRates(for currencyCode: String) async {
-        let rates = try? await Self.fetchRates(currency: currencyCode)
+        let rates = try? await Self.fetchRates(for: currencyCode)
         cacheRates(rates)
     }
 
@@ -36,7 +36,7 @@ public actor Forex {
 
         var rates = cachedRates(for: destinationCurrencyCode)
         if rates == nil {
-            rates = try? await Self.fetchRates(currency: destinationCurrencyCode)
+            rates = try? await Self.fetchRates(for: destinationCurrencyCode)
             cacheRates(rates)
         }
         guard let rates else { return 0.0 }
@@ -61,9 +61,10 @@ extension Forex {
 }
 
 public extension Forex {
-    static func fetchCurrencies(for date: Date = .now) async throws -> [Currency] {
+    static func fetchCurrencies(for date: Date? = nil) async throws -> [Currency] {
+        let dateParameter = date != nil ? dateFormatter.string(from: date!) : "latest"
         guard let url = URL(string: baseURLString)?
-            .appending(path: "currency-api@\(Forex.dateFormatter.string(from: date))")
+            .appending(path: "currency-api@\(dateParameter)")
             .appending(path: "v1")
             .appending(path: "currencies.json")
         else {
@@ -78,9 +79,10 @@ public extension Forex {
         }
     }
 
-    static func fetchRates(for date: Date = .now, currency: String) async throws -> Rates {
+    static func fetchRates(for currency: String, date: Date? = nil) async throws -> Rates {
+        let dateParameter = date != nil ? dateFormatter.string(from: date!) : "latest"
         guard let url = URL(string: baseURLString)?
-            .appending(path: "currency-api@\(dateFormatter.string(from: date))")
+            .appending(path: "currency-api@\(dateParameter)")
             .appending(path: "v1").appending(path: "currencies")
             .appending(path: "\(currency.lowercased()).json")
         else {
