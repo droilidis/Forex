@@ -84,7 +84,11 @@ public actor Forex {
 
         let rates = try await rates(for: destination)
 
-        guard let pair = rates.pairs.first(where: { $0.code == source }), pair.rate != 0 else {
+        // Reject zero, negative, and non-finite (inf/NaN) rates: a degraded payload must
+        // surface as a thrown error, not as garbage output (negative amounts, or
+        // `value / .infinity == 0`).
+        guard let pair = rates.pairs.first(where: { $0.code == source }),
+              pair.rate.isFinite, pair.rate > 0 else {
             throw ForexError.rateUnavailable(source: source, destination: destination)
         }
 

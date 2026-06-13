@@ -86,6 +86,67 @@ final class ForexTests: XCTestCase {
         }
     }
 
+    // MARK: - Degraded payloads (regression for review findings 1 & 2)
+
+    func testRatesDecodingMissingBaseObjectThrows() {
+        // Valid JSON and HTTP 200, but the base-currency object is absent: must throw,
+        // not decode to an empty table that then gets cached as fresh for the full TTL.
+        let json = #"{ "date": "2024-03-06" }"#.data(using: .utf8)!
+        XCTAssertThrowsError(try Rates.rates(from: json)) { error in
+            guard case ForexError.dataParsingError = error else {
+                return XCTFail("Expected dataParsingError, got \(error)")
+            }
+        }
+    }
+
+    func testRatesDecodingEmptyTableThrows() {
+        let json = #"{ "date": "2024-03-06", "eur": {} }"#.data(using: .utf8)!
+        XCTAssertThrowsError(try Rates.rates(from: json)) { error in
+            guard case ForexError.dataParsingError = error else {
+                return XCTFail("Expected dataParsingError, got \(error)")
+            }
+        }
+    }
+
+    func testRatesDecodingMultipleBasesThrows() {
+        let json = #"{ "date": "2024-03-06", "eur": { "usd": 1.08 }, "gbp": { "usd": 1.27 } }"#.data(using: .utf8)!
+        XCTAssertThrowsError(try Rates.rates(from: json)) { error in
+            guard case ForexError.dataParsingError = error else {
+                return XCTFail("Expected dataParsingError, got \(error)")
+            }
+        }
+    }
+
+    func testConvertThrowsOnNonPositiveRate() async {
+        let forex = Forex()
+        await forex.preload(Rates(date: Date(), code: "USD", pairs: [
+            Rates.Pair(code: "EUR", rate: -0.5)
+        ]))
+        do {
+            _ = try await forex.convert(value: 10, from: "EUR", to: "USD")
+            XCTFail("Expected rateUnavailable for a negative rate")
+        } catch ForexError.rateUnavailable {
+            // expected
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testConvertThrowsOnNonFiniteRate() async {
+        let forex = Forex()
+        await forex.preload(Rates(date: Date(), code: "USD", pairs: [
+            Rates.Pair(code: "EUR", rate: .infinity)
+        ]))
+        do {
+            _ = try await forex.convert(value: 10, from: "EUR", to: "USD")
+            XCTFail("Expected rateUnavailable for a non-finite rate")
+        } catch ForexError.rateUnavailable {
+            // expected
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
     // MARK: - Date formatting
 
     func testDateFormatterUsesCalendarYearNotWeekYear() {

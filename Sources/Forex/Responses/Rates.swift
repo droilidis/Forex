@@ -30,17 +30,30 @@ public struct Rates: Codable, Sendable {
 
         self.date = try container.decode(Date.self, forKey: .date)
 
-        // The payload shape is `{ "date": ..., "<base>": { "<code>": rate, ... } }`,
-        // so the base currency appears as a dynamic key alongside the static `date` key.
-        var codeString = ""
-        var pairsMap = [String: Double]()
+        // The payload shape is `{ "date": ..., "<base>": { "<code>": rate, ... } }`:
+        // exactly one dynamic key (the base currency) sits alongside the static `date`
+        // key. Require it explicitly so a degraded-but-valid-JSON 200 response (missing
+        // or duplicated base object, or an empty table) fails to decode instead of
+        // silently yielding an empty `Rates` that would then be cached as "fresh".
         let dynamicContainer = try decoder.container(keyedBy: DynamicKey.self)
-        for key in dynamicContainer.allKeys where CodingKeys(rawValue: key.stringValue) == nil {
-            codeString = key.stringValue
-            pairsMap = try dynamicContainer.decode([String: Double].self, forKey: key)
-        }
-        self.code = codeString.uppercased()
+        let baseKeys = dynamicContainer.allKeys.filter { CodingKeys(rawValue: $0.stringValue) == nil }
 
+        guard baseKeys.count == 1, let baseKey = baseKeys.first else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: dynamicContainer.codingPath,
+                debugDescription: "Expected exactly one base-currency object, found \(baseKeys.count)."
+            ))
+        }
+
+        let pairsMap = try dynamicContainer.decode([String: Double].self, forKey: baseKey)
+        guard !pairsMap.isEmpty else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: dynamicContainer.codingPath,
+                debugDescription: "Rate table for '\(baseKey.stringValue)' is empty."
+            ))
+        }
+
+        self.code = baseKey.stringValue.uppercased()
         self.pairs = pairsMap.map { Pair(code: $0.key.uppercased(), rate: $0.value) }
     }
 }
