@@ -1,13 +1,24 @@
 import Foundation
 
 public struct Rates: Codable, Sendable {
-    let date: Date
-    let code: String
-    let pairs: [Pair]
+    public let date: Date
+    public let code: String
+    public let pairs: [Pair]
 
-    struct Pair: Codable {
-        let code: String
-        let rate: Double
+    public struct Pair: Codable, Sendable, Hashable {
+        public let code: String
+        public let rate: Double
+
+        public init(code: String, rate: Double) {
+            self.code = code
+            self.rate = rate
+        }
+    }
+
+    public init(date: Date, code: String, pairs: [Pair]) {
+        self.date = date
+        self.code = code
+        self.pairs = pairs
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -19,17 +30,18 @@ public struct Rates: Codable, Sendable {
 
         self.date = try container.decode(Date.self, forKey: .date)
 
+        // The payload shape is `{ "date": ..., "<base>": { "<code>": rate, ... } }`,
+        // so the base currency appears as a dynamic key alongside the static `date` key.
         var codeString = ""
         var pairsMap = [String: Double]()
         let dynamicContainer = try decoder.container(keyedBy: DynamicKey.self)
-        try dynamicContainer.allKeys.forEach { key in
-            guard CodingKeys(rawValue: key.stringValue) == nil else { return }
+        for key in dynamicContainer.allKeys where CodingKeys(rawValue: key.stringValue) == nil {
             codeString = key.stringValue
             pairsMap = try dynamicContainer.decode([String: Double].self, forKey: key)
         }
         self.code = codeString.uppercased()
 
-        self.pairs = pairsMap.map({ Pair(code: $0.key.uppercased(), rate: $0.value) })
+        self.pairs = pairsMap.map { Pair(code: $0.key.uppercased(), rate: $0.value) }
     }
 }
 
@@ -38,10 +50,9 @@ public extension Rates {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .formatted(Forex.dateFormatter)
         do {
-            let response = try decoder.decode(Rates.self, from: data)
-            return response
+            return try decoder.decode(Rates.self, from: data)
         } catch {
-            throw ForexError.dataParsingError(error)
+            throw ForexError.dataParsingError(String(describing: error))
         }
     }
 }

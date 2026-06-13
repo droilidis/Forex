@@ -5,7 +5,8 @@ import PackageDescription
 
 let package = Package(
     name: "Forex",
-    platforms: [.iOS("16.0"), .macOS("11.0")],
+    // `URL.appending(path:)` used below requires iOS 16 / macOS 13. The previous macOS 11 floor did not compile.
+    platforms: [.iOS("16.0"), .macOS("13.0")],
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
