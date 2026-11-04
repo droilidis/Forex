@@ -1,68 +1,86 @@
 import Foundation
 
-// MARK: - Errors
+/// A cache of exchange-rate tables over a ``ForexClient``, and conversion with them.
+///
+/// Each caller creates its own instance and chooses the policy: a bare `Forex()` keeps tables
+/// in memory, treats them as fresh for 24 hours, falls back to the last table when a refresh
+/// fails, and never waits for a connection.
+///
+/// `Forex` is an `actor`, so its state is isolated and concurrent callers are data-race free.
+/// Concurrent requests for the same currency are de-duplicated ("single-flight"): a burst of
+/// conversions triggers at most one network request per currency, rather than one per caller.
+public actor Forex {
+    /// What to do with a table older than `freshness`.
+    public enum StalePolicy: Sendable {
+        /// Fetch first, and fall back to the table when the fetch fails.
+        case fetchFirst
 
-public enum ForexError: Error, Sendable {
-    case invalidURL
-    case networkError(String)
-    case invalidResponse
-    case dataParsingError(String)
-    case rateUnavailable(source: String, destination: String)
-}
+        /// Return the table at once and refresh it in the background. A table older than
+        /// `maximumAge` (`nil`: no limit) is handled as in ``fetchFirst``.
+        case refreshInBackground(maximumAge: TimeInterval? = nil)
+    }
 
-extension ForexError: LocalizedError {
-    public var errorDescription: String? {
-        switch self {
-        case .invalidURL:
-            return "The exchange-rate request URL could not be constructed."
-        case .networkError(let message):
-            return "A network error occurred: \(message)"
-        case .invalidResponse:
-            return "The exchange-rate server returned an invalid response."
-        case .dataParsingError(let message):
-            return "The exchange-rate data could not be parsed: \(message)"
-        case .rateUnavailable(let source, let destination):
-            return "No exchange rate is available from \(source) to \(destination)."
+    private let client: ForexClient
+    private let store: any RatesStore
+    private let freshness: TimeInterval
+    private let stalePolicy: StalePolicy
+    private let failureWindow: Duration
+
+    /// - Parameters:
+    ///   - client: fetches the tables.
+    ///   - store: where tables are kept (default: in memory).
+    ///   - freshness: how long a table stays fresh (default 24 hours, as the upstream API
+    ///     publishes new rates roughly once a day).
+    ///   - stalePolicy: what to do with an older table (default ``StalePolicy/fetchFirst``).
+    ///   - failureWindow: how long a failed fetch makes further calls for that currency fail
+    ///     at once without a request (default 10 seconds), so converting many prices one by
+    ///     one makes one request. A call in the window uses the last table if there is one,
+    ///     and otherwise throws the fetch's error.
+    public init(
+        client: ForexClient = ForexClient(),
+        store: any RatesStore = InMemoryRatesStore(),
+        freshness: TimeInterval = 24 * 60 * 60,
+        stalePolicy: StalePolicy = .fetchFirst,
+        failureWindow: Duration = .seconds(10)
+    ) {
+        self.client = client
+        self.store = store
+        self.freshness = freshness
+        self.stalePolicy = stalePolicy
+        self.failureWindow = failureWindow
+    }
+
+    deinit {
+        for subscriber in subscribers.values {
+            subscriber.finish()
         }
     }
-}
 
-// MARK: - Forex
+    // MARK: State (actor-isolated, keyed by uppercased currency code)
 
-/// Currency conversion backed by the free exchange-rate API at
-/// https://github.com/fawazahmed0/exchange-api (served via the jsDelivr CDN).
-///
-/// `Forex` is an `actor`, so its rate cache is isolated and concurrent callers are
-/// data-race free. Concurrent requests for the same currency are additionally
-/// de-duplicated ("single-flight"): a burst of conversions triggers at most one
-/// network request per currency, rather than one request per caller.
-public actor Forex {
-    public static let shared = Forex()
+    private struct Failure {
+        let error: Error
 
-    private static let baseURLString = "https://cdn.jsdelivr.net/npm/@fawazahmed0/"
-
-    /// How long fetched rates stay fresh before a re-fetch is attempted. The upstream
-    /// API publishes new rates roughly once per day.
-    private let cacheTTL: TimeInterval
-
-    /// - Parameter cacheTTL: freshness window for cached rates (default 24 hours).
-    public init(cacheTTL: TimeInterval = 24 * 60 * 60) {
-        self.cacheTTL = cacheTTL
+        /// On a monotonic clock, as a wall clock set back would hold the window open for as
+        /// long as it moved.
+        let until: ContinuousClock.Instant
     }
 
-    // MARK: Cache state (actor-isolated)
+    /// The latest table of each currency, so a conversion doesn't read the store.
+    private var tables: [String: StoredRates] = [:]
 
-    private struct CacheEntry {
-        let rates: Rates
-        let fetchedAt: Date
-    }
+    /// The reads from the store, one per currency, shared by concurrent callers. A read that
+    /// succeeded stays, so a currency is read only once. A failed one goes, so that the next
+    /// call reads again.
+    private var loads: [String: Task<Void, Never>] = [:]
 
-    /// Most recently fetched rates, keyed by uppercased base-currency code.
-    private var cache: [String: CacheEntry] = [:]
-
-    /// In-flight fetches, keyed by uppercased base-currency code, so concurrent
-    /// callers for the same currency share a single network request.
+    /// In-flight fetches, so concurrent callers for a currency share a single request.
     private var inFlight: [String: Task<Rates, Error>] = [:]
+
+    /// The last failed fetch of each currency, which holds back requests until `until`.
+    private var failures: [String: Failure] = [:]
+
+    private var subscribers: [UUID: AsyncStream<String>.Continuation] = [:]
 
     // MARK: Public API
 
@@ -70,156 +88,119 @@ public actor Forex {
     ///
     /// Rates are fetched for the *destination* currency and cached, so a list of
     /// conversions into the same destination (the common case — a single preferred
-    /// currency) shares one network request and one cache entry.
+    /// currency) shares one network request and one table.
     ///
     /// - Returns: `value` expressed in `destinationCurrencyCode`.
-    /// - Throws: ``ForexError`` if rates cannot be fetched and none are cached, or
-    ///   ``ForexError/rateUnavailable(source:destination:)`` if the source currency
-    ///   is absent from the destination's rate table.
+    /// - Throws: ``ForexError`` if rates cannot be fetched and no table is stored, or
+    ///   ``ForexError/rateUnavailable(source:destination:)`` if the table has no usable rate
+    ///   for the source currency.
     public func convert(value: Double, from sourceCurrencyCode: String, to destinationCurrencyCode: String) async throws -> Double {
-        let source = sourceCurrencyCode.uppercased()
-        let destination = destinationCurrencyCode.uppercased()
+        guard sourceCurrencyCode.uppercased() != destinationCurrencyCode.uppercased() else { return value }
 
-        guard source != destination else { return value }
-
-        let rates = try await rates(for: destination)
-
-        // Reject zero, negative, and non-finite (inf/NaN) rates: a degraded payload must
-        // surface as a thrown error, not as garbage output (negative amounts, or
-        // `value / .infinity == 0`).
-        guard let pair = rates.pairs.first(where: { $0.code == source }),
-              pair.rate.isFinite, pair.rate > 0 else {
-            throw ForexError.rateUnavailable(source: source, destination: destination)
-        }
-
-        // `rates` is the table for `destination`, so `pair.rate` is "source per 1
-        // destination"; dividing `value` (in source) by it yields the destination amount.
-        return value / pair.rate
+        return try await rates(for: destinationCurrencyCode).convert(value: value, from: sourceCurrencyCode)
     }
 
-    /// Warms the cache for a currency (e.g. the user's preferred currency) so later
+    /// Readies the table for a currency (e.g. the user's preferred currency) so later
     /// conversions are instant. Best-effort: network errors are ignored.
     public func prefetchRates(for currencyCode: String) async {
         _ = try? await rates(for: currencyCode)
     }
 
-    // MARK: Single-flight cache
+    /// The uppercased code of each currency whose table is stored from now on: one element
+    /// per table fetched, even when its rates are the same as the last one's, and even when
+    /// the store failed to save it, as conversions use it from then on.
+    ///
+    /// Each call returns a stream of its own. A stream finishes when this instance goes away.
+    public func updates() -> AsyncStream<String> {
+        let id = UUID()
+        let (stream, subscriber) = AsyncStream.makeStream(of: String.self)
+        subscriber.onTermination = { [weak self] _ in
+            Task { await self?.removeSubscriber(id) }
+        }
+        subscribers[id] = subscriber
+        return stream
+    }
 
-    /// Returns rates for `code`: a fresh cache hit, a joined in-flight request, or a
-    /// newly started one. On fetch failure it falls back to stale cached rates if any
-    /// exist (so a transient outage keeps using the last known rates); otherwise it rethrows.
+    private func removeSubscriber(_ id: UUID) {
+        subscribers[id] = nil
+    }
+
+    // MARK: Cache
+
+    /// Returns the table for `code` as the policy says. When a fetch fails, it falls back to
+    /// the last table if there is one, so a transient outage keeps using the last known
+    /// rates; otherwise it rethrows.
     private func rates(for code: String) async throws -> Rates {
         let key = code.uppercased()
 
-        if let entry = cache[key], Date().timeIntervalSince(entry.fetchedAt) < cacheTTL {
-            return entry.rates
+        if let table = await storedTable(for: key) {
+            // A fetch date in the future means the clock moved: the age says nothing.
+            let age = Date().timeIntervalSince(table.fetchedAt)
+            if age >= 0, age < freshness {
+                return table.rates
+            }
+            if case .refreshInBackground(let maximumAge) = stalePolicy, age < maximumAge ?? .infinity {
+                _ = try? sharedFetch(for: key)
+                return table.rates
+            }
         }
 
-        // Join an existing in-flight fetch for this currency rather than starting another.
-        if let existing = inFlight[key] {
+        do {
+            return try await sharedFetch(for: key).value
+        } catch {
+            if let table = tables[key] { return table.rates }
+            throw error
+        }
+    }
+
+    /// The latest table for `key`, from the store until there's one in memory.
+    private func storedTable(for key: String) async -> StoredRates? {
+        if let table = tables[key] { return table }
+
+        let load = loads[key] ?? Task {
             do {
-                return try await existing.value
+                let stored = try await store.load(currency: key)
+                // After a failed read, a fetch may have stored a newer table in the meantime.
+                tables[key] = tables[key] ?? stored
             } catch {
-                if let stale = cache[key]?.rates { return stale }
+                loads[key] = nil
+            }
+        }
+        loads[key] = load
+        await load.value
+        return tables[key]
+    }
+
+    /// The fetch in flight for `key`, or a new one. The fetch stores its table itself, as a
+    /// background refresh has no caller waiting for it.
+    ///
+    /// - Throws: the last failure's error, inside the failure window.
+    private func sharedFetch(for key: String) throws -> Task<Rates, Error> {
+        if let task = inFlight[key] { return task }
+
+        if let failure = failures[key], ContinuousClock.Instant.now < failure.until {
+            throw failure.error
+        }
+
+        // Registered before the task can run, as the task runs on this actor: concurrent
+        // callers entering this method find it and join (single-flight).
+        let task = Task<Rates, Error> {
+            defer { inFlight[key] = nil }
+            do {
+                let rates = try await client.fetchRates(for: key)
+                let table = StoredRates(rates: rates, fetchedAt: Date())
+                tables[key] = table
+                try? await store.save(table)
+                for subscriber in subscribers.values {
+                    subscriber.yield(key)
+                }
+                return rates
+            } catch {
+                failures[key] = Failure(error: error, until: .now + failureWindow)
                 throw error
             }
         }
-
-        // Own a new fetch. Register it *before* the first suspension point so that
-        // concurrent callers entering this method find it and join (single-flight).
-        // Only one owner can exist per key, so this owner clears exactly its own task.
-        let task = Task { try await Self.fetchRates(for: key) }
         inFlight[key] = task
-        defer { inFlight[key] = nil }
-
-        do {
-            let rates = try await task.value
-            cache[key] = CacheEntry(rates: rates, fetchedAt: Date())
-            return rates
-        } catch {
-            if let stale = cache[key]?.rates { return stale }
-            throw error
-        }
-    }
-}
-
-// MARK: - Networking
-
-extension Forex {
-    /// A `DateFormatter` is costly to create and is thread-safe for read-only
-    /// formatting/parsing once configured, so it is built once. Uses `yyyy` (calendar
-    /// year) — not `YYYY` (week-of-year year, a classic off-by-a-year bug around the
-    /// new year) — with a fixed POSIX locale and UTC zone for stable parsing.
-    static let dateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter
-    }()
-
-    private static let session: URLSession = {
-        let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 30
-        configuration.waitsForConnectivity = true
-        return URLSession(configuration: configuration)
-    }()
-
-    private static func versionedBaseURL(date: Date?) throws -> URL {
-        let dateParameter = date.map { dateFormatter.string(from: $0) } ?? "latest"
-        guard let url = URL(string: baseURLString)?
-            .appending(path: "currency-api@\(dateParameter)")
-            .appending(path: "v1")
-        else {
-            throw ForexError.invalidURL
-        }
-        return url
-    }
-
-    private static func data(from url: URL) async throws -> Data {
-        do {
-            let (data, response) = try await session.data(from: url)
-            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                throw ForexError.invalidResponse
-            }
-            return data
-        } catch let error as ForexError {
-            throw error
-        } catch {
-            throw ForexError.networkError(error.localizedDescription)
-        }
-    }
-}
-
-#if DEBUG
-extension Forex {
-    /// Test seam: preload the cache with known rates so the conversion and
-    /// single-flight logic can be exercised without network access. Debug-only.
-    func preload(_ rates: Rates, fetchedAt: Date = Date()) {
-        cache[rates.code.uppercased()] = CacheEntry(rates: rates, fetchedAt: fetchedAt)
-    }
-}
-#endif
-
-public extension Forex {
-    /// Fetches the list of supported currencies (code and display name).
-    /// - Parameter date: a historical date, or `nil` for the latest rates.
-    static func fetchCurrencies(for date: Date? = nil) async throws -> [Currency] {
-        let url = try versionedBaseURL(date: date).appending(path: "currencies.json")
-        let data = try await data(from: url)
-        return try Currency.currencies(from: data)
-    }
-
-    /// Fetches the exchange-rate table for a single base currency.
-    /// - Parameters:
-    ///   - currency: the ISO base-currency code (case-insensitive).
-    ///   - date: a historical date, or `nil` for the latest rates.
-    static func fetchRates(for currency: String, date: Date? = nil) async throws -> Rates {
-        let url = try versionedBaseURL(date: date)
-            .appending(path: "currencies")
-            .appending(path: "\(currency.lowercased()).json")
-        let data = try await data(from: url)
-        return try Rates.rates(from: data)
+        return task
     }
 }

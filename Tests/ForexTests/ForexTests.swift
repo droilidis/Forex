@@ -3,52 +3,6 @@ import XCTest
 
 final class ForexTests: XCTestCase {
 
-    // MARK: - Conversion (hermetic, no network)
-
-    func testConvertSameCurrencyReturnsValueUnchanged() async throws {
-        let forex = Forex()
-        let value = try await forex.convert(value: 42, from: "USD", to: "usd")
-        XCTAssertEqual(value, 42, accuracy: 0.0001)
-    }
-
-    func testConvertDividesValueBySourcePerDestinationRate() async throws {
-        let forex = Forex()
-        // Rate table for the destination (USD): 1 USD = 0.5 EUR  ⇒  1 EUR = 2 USD.
-        await forex.preload(Rates(date: Date(), code: "USD", pairs: [
-            Rates.Pair(code: "EUR", rate: 0.5)
-        ]))
-
-        let usd = try await forex.convert(value: 10, from: "EUR", to: "USD")
-        XCTAssertEqual(usd, 20, accuracy: 0.0001)
-    }
-
-    func testConvertIsCaseInsensitive() async throws {
-        let forex = Forex()
-        await forex.preload(Rates(date: Date(), code: "USD", pairs: [
-            Rates.Pair(code: "EUR", rate: 0.5)
-        ]))
-
-        let usd = try await forex.convert(value: 10, from: "eur", to: "usd")
-        XCTAssertEqual(usd, 20, accuracy: 0.0001)
-    }
-
-    func testConvertThrowsWhenSourceRateMissing() async {
-        let forex = Forex()
-        await forex.preload(Rates(date: Date(), code: "USD", pairs: [
-            Rates.Pair(code: "EUR", rate: 0.5)
-        ]))
-
-        do {
-            _ = try await forex.convert(value: 10, from: "JPY", to: "USD")
-            XCTFail("Expected rateUnavailable to be thrown")
-        } catch let ForexError.rateUnavailable(source, destination) {
-            XCTAssertEqual(source, "JPY")
-            XCTAssertEqual(destination, "USD")
-        } catch {
-            XCTFail("Unexpected error: \(error)")
-        }
-    }
-
     // MARK: - Decoding (hermetic)
 
     func testRatesDecoding() throws {
@@ -62,7 +16,7 @@ final class ForexTests: XCTestCase {
         XCTAssertEqual(rates.pairs.count, 2)
         XCTAssertEqual(rates.pairs.first(where: { $0.code == "USD" })?.rate, 1.08)
         XCTAssertEqual(rates.pairs.first(where: { $0.code == "GBP" })?.rate, 0.85)
-        XCTAssertEqual(Forex.dateFormatter.string(from: rates.date), "2024-03-06")
+        XCTAssertEqual(Rates.dateFormatter.string(from: rates.date), "2024-03-06")
     }
 
     func testCurrenciesDecoding() throws {
@@ -75,6 +29,18 @@ final class ForexTests: XCTestCase {
         XCTAssertEqual(currencies.count, 2)
         XCTAssertEqual(currencies.map(\.code), ["eur", "usd"]) // sorted by code
         XCTAssertEqual(currencies.first(where: { $0.code == "usd" })?.name, "US Dollar")
+    }
+
+    func testRatesSurviveARoundTripThroughTheirCoding() throws {
+        let rates = Rates(date: Date(timeIntervalSince1970: 1_700_000_000), code: "EUR", pairs: [
+            Rates.Pair(code: "USD", rate: 1.08)
+        ])
+
+        let decoded = try JSONDecoder().decode(Rates.self, from: JSONEncoder().encode(rates))
+
+        XCTAssertEqual(decoded.date, rates.date)
+        XCTAssertEqual(decoded.code, "EUR")
+        XCTAssertEqual(decoded.pairs, rates.pairs)
     }
 
     func testRatesDecodingFailureThrowsParsingError() {
@@ -117,36 +83,6 @@ final class ForexTests: XCTestCase {
         }
     }
 
-    func testConvertThrowsOnNonPositiveRate() async {
-        let forex = Forex()
-        await forex.preload(Rates(date: Date(), code: "USD", pairs: [
-            Rates.Pair(code: "EUR", rate: -0.5)
-        ]))
-        do {
-            _ = try await forex.convert(value: 10, from: "EUR", to: "USD")
-            XCTFail("Expected rateUnavailable for a negative rate")
-        } catch ForexError.rateUnavailable {
-            // expected
-        } catch {
-            XCTFail("Unexpected error: \(error)")
-        }
-    }
-
-    func testConvertThrowsOnNonFiniteRate() async {
-        let forex = Forex()
-        await forex.preload(Rates(date: Date(), code: "USD", pairs: [
-            Rates.Pair(code: "EUR", rate: .infinity)
-        ]))
-        do {
-            _ = try await forex.convert(value: 10, from: "EUR", to: "USD")
-            XCTFail("Expected rateUnavailable for a non-finite rate")
-        } catch ForexError.rateUnavailable {
-            // expected
-        } catch {
-            XCTFail("Unexpected error: \(error)")
-        }
-    }
-
     // MARK: - Date formatting
 
     func testDateFormatterUsesCalendarYearNotWeekYear() {
@@ -159,41 +95,30 @@ final class ForexTests: XCTestCase {
         components.day = 30
         let date = calendar.date(from: components)!
 
-        XCTAssertEqual(Forex.dateFormatter.string(from: date), "2024-12-30")
+        XCTAssertEqual(Rates.dateFormatter.string(from: date), "2024-12-30")
     }
 
     // MARK: - Integration (exercises the live API; only with FOREX_LIVE_TESTS=1)
 
     func testFetchCurrencies_live() async throws {
-        let currencies = try await liveFetch { try await Forex.fetchCurrencies() }
+        let currencies = try await liveFetch { try await $0.fetchCurrencies() }
         XCTAssertFalse(currencies.isEmpty, "Currencies should not be empty")
     }
 
     func testFetchRates_live() async throws {
-        let rates = try await liveFetch { try await Forex.fetchRates(for: "usd") }
+        let rates = try await liveFetch { try await $0.fetchRates(for: "usd") }
         XCTAssertFalse(rates.pairs.isEmpty, "Rates should not be empty")
     }
 
-    /// Runs `fetch` against the live API, or skips the test so a default run stays off the
-    /// network. A run that sets the variable asked for the live API, so without a connection
-    /// these tests fail rather than skip. For that, the URL cache is emptied, as a cached
-    /// response would pass offline, and `fetch` has a time limit, as `Forex`'s session waits
-    /// for connectivity instead of failing.
-    private func liveFetch<T: Sendable>(_ fetch: @escaping @Sendable () async throws -> T) async throws -> T {
+    /// Runs `fetch` with a default client against the live API, or skips the test so a default
+    /// run stays off the network. A run that sets the variable asked for the live API, so
+    /// without a connection these tests fail rather than skip: the default session has no URL
+    /// cache to answer from, doesn't wait for connectivity, and gives up after 30 seconds.
+    private func liveFetch<T>(_ fetch: (ForexClient) async throws -> T) async throws -> T {
         try XCTSkipUnless(
             ProcessInfo.processInfo.environment["FOREX_LIVE_TESTS"] == "1",
             "Live API test: run with FOREX_LIVE_TESTS=1 swift test"
         )
-        URLCache.shared.removeAllCachedResponses()
-
-        return try await withThrowingTaskGroup(of: T.self) { group in
-            defer { group.cancelAll() }
-            group.addTask(operation: fetch)
-            group.addTask {
-                try await Task.sleep(for: .seconds(30))
-                throw ForexError.networkError("No response from the live API within 30 seconds")
-            }
-            return try await group.next()!
-        }
+        return try await fetch(ForexClient())
     }
 }

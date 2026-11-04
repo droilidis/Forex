@@ -5,19 +5,19 @@ public struct Rates: Codable, Sendable {
     public let code: String
     public let pairs: [Pair]
 
-    public struct Pair: Codable, Sendable, Hashable {
+    public struct Pair: Sendable, Hashable {
         public let code: String
         public let rate: Double
 
         public init(code: String, rate: Double) {
-            self.code = code
+            self.code = code.uppercased()
             self.rate = rate
         }
     }
 
     public init(date: Date, code: String, pairs: [Pair]) {
         self.date = date
-        self.code = code
+        self.code = code.uppercased()
         self.pairs = pairs
     }
 
@@ -54,14 +54,49 @@ public struct Rates: Codable, Sendable {
         }
 
         self.code = baseKey.stringValue.uppercased()
-        self.pairs = pairsMap.map { Pair(code: $0.key.uppercased(), rate: $0.value) }
+        self.pairs = pairsMap.map { Pair(code: $0.key, rate: $0.value) }
+    }
+
+    /// Writes the payload's shape, the one `init(from:)` reads, so a table survives a round
+    /// trip through any coder with the same date strategy on both sides.
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: DynamicKey.self)
+        try container.encode(date, forKey: DynamicKey(CodingKeys.date.rawValue))
+        let pairsMap = Dictionary(pairs.map { ($0.code, $0.rate) }, uniquingKeysWith: { first, _ in first })
+        try container.encode(pairsMap, forKey: DynamicKey(code))
+    }
+}
+
+public extension Rates {
+    /// `value` in the currency `sourceCurrencyCode`, expressed in this table's currency.
+    ///
+    /// A table is for its *destination* currency: `pair.rate` is "source per 1 destination",
+    /// so the result is `value / pair.rate`. The code is case-insensitive, and the table's
+    /// own currency returns `value` unchanged.
+    ///
+    /// - Throws: ``ForexError/rateUnavailable(source:destination:)`` when the source currency
+    ///   isn't in the table, or its rate is zero, negative or non-finite.
+    func convert(value: Double, from sourceCurrencyCode: String) throws -> Double {
+        let source = sourceCurrencyCode.uppercased()
+
+        guard source != code else { return value }
+
+        // Reject zero, negative, and non-finite (inf/NaN) rates: a degraded payload must
+        // surface as a thrown error, not as garbage output (negative amounts, or
+        // `value / .infinity == 0`).
+        guard let pair = pairs.first(where: { $0.code == source }),
+              pair.rate.isFinite, pair.rate > 0 else {
+            throw ForexError.rateUnavailable(source: source, destination: code)
+        }
+
+        return value / pair.rate
     }
 }
 
 public extension Rates {
     static func rates(from data: Data) throws -> Rates {
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .formatted(Forex.dateFormatter)
+        decoder.dateDecodingStrategy = .formatted(dateFormatter)
         do {
             return try decoder.decode(Rates.self, from: data)
         } catch {
@@ -70,9 +105,28 @@ public extension Rates {
     }
 }
 
+extension Rates {
+    /// A `DateFormatter` is costly to create and is thread-safe for read-only
+    /// formatting/parsing once configured, so it is built once. Uses `yyyy` (calendar
+    /// year) — not `YYYY` (week-of-year year, a classic off-by-a-year bug around the
+    /// new year) — with a fixed POSIX locale and UTC zone for stable parsing.
+    static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+}
+
 private struct DynamicKey: CodingKey {
     var stringValue: String
     init?(stringValue: String) {
+        self.stringValue = stringValue
+    }
+
+    init(_ stringValue: String) {
         self.stringValue = stringValue
     }
 
