@@ -27,3 +27,10 @@ known rates are used until one succeeds.
 
 `convert` throws `ForexError` when no rate is available, so callers can distinguish a
 genuine value from a failed conversion.
+
+## Testing
+
+```
+swift test                     # no network: the two live API tests are skipped
+FOREX_LIVE_TESTS=1 swift test  # also runs the live API tests against the CDN
+```

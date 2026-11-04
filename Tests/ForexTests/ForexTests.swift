@@ -162,22 +162,38 @@ final class ForexTests: XCTestCase {
         XCTAssertEqual(Forex.dateFormatter.string(from: date), "2024-12-30")
     }
 
-    // MARK: - Integration (requires network; exercises the live API)
+    // MARK: - Integration (exercises the live API; only with FOREX_LIVE_TESTS=1)
 
     func testFetchCurrencies_live() async throws {
-        try XCTSkipIf(isOffline, "Requires network access")
-        let currencies = try await Forex.fetchCurrencies()
+        let currencies = try await liveFetch { try await Forex.fetchCurrencies() }
         XCTAssertFalse(currencies.isEmpty, "Currencies should not be empty")
     }
 
     func testFetchRates_live() async throws {
-        try XCTSkipIf(isOffline, "Requires network access")
-        let rates = try await Forex.fetchRates(for: "usd")
+        let rates = try await liveFetch { try await Forex.fetchRates(for: "usd") }
         XCTAssertFalse(rates.pairs.isEmpty, "Rates should not be empty")
     }
 
-    /// Crude offline check so the live tests skip instead of failing without a connection.
-    private var isOffline: Bool {
-        (try? Data(contentsOf: URL(string: "https://cdn.jsdelivr.net")!)) == nil
+    /// Runs `fetch` against the live API, or skips the test so a default run stays off the
+    /// network. A run that sets the variable asked for the live API, so without a connection
+    /// these tests fail rather than skip. For that, the URL cache is emptied, as a cached
+    /// response would pass offline, and `fetch` has a time limit, as `Forex`'s session waits
+    /// for connectivity instead of failing.
+    private func liveFetch<T: Sendable>(_ fetch: @escaping @Sendable () async throws -> T) async throws -> T {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["FOREX_LIVE_TESTS"] == "1",
+            "Live API test: run with FOREX_LIVE_TESTS=1 swift test"
+        )
+        URLCache.shared.removeAllCachedResponses()
+
+        return try await withThrowingTaskGroup(of: T.self) { group in
+            defer { group.cancelAll() }
+            group.addTask(operation: fetch)
+            group.addTask {
+                try await Task.sleep(for: .seconds(30))
+                throw ForexError.networkError("No response from the live API within 30 seconds")
+            }
+            return try await group.next()!
+        }
     }
 }

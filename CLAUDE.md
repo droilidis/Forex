@@ -17,8 +17,9 @@ swift test
   diagnostics as hard errors. After non-trivial changes, run an independent review focused on
   concurrency and conversion correctness.
 - Tests are XCTest. Most are **hermetic** (no network) via the `#if DEBUG` `preload(_:)` seam.
-  Two `*_live` integration tests hit the real CDN and **auto-skip when offline**
-  (`XCTSkipIf(isOffline)`), so `swift test` stays green without a connection.
+  Two `*_live` integration tests hit the real CDN and run **only when asked**: `swift test`
+  skips them and makes no network request, and `FOREX_LIVE_TESTS=1 swift test` runs them. With
+  the variable set and no network they fail, as the run asked for them.
 
 ## Public API (`Sources/Forex/`)
 
